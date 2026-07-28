@@ -1,9 +1,15 @@
 -- primary segmentation - monthly rollup by business_line
--- Aggregates the point-in-time primary segmentation output up to
--- year / month / business_line, reproducing the reviewed results grid:
---   year, month, total_users, active_users, order_count, total_sessions, npb_ordered, business_line
--- Segment attributes are still resolved point-in-time via segment_state_ranges
--- (valid_from / valid_until built with LEAD), matching daily_segment_timeseries.
+-- Reconciled to the base query (daily_segment_timeseries) logic.
+--
+-- This uses the SAME daily_kpis metric definitions as the base query so the
+-- numbers reconcile: summing every primary_segment here equals the base query.
+-- Differences that previously appeared vs the base query were caused by:
+--   1. missing WHERE activity_date >= '2024-04-01' filter
+--   2. counting total_users / active_users DISTINCT-per-month instead of the
+--      base query's DISTINCT-per-day (summed = user-active-days)
+--   3. LEFT JOIN to the snapshot (Unclassified) instead of the base INNER JOIN
+--   4. different session / order metric plumbing
+-- All four are aligned below.
 
 ;WITH
 segment_state_ranges AS (
@@ -30,93 +36,97 @@ segment_state_ranges AS (
     FROM dbo.segment_customer_snapshot
 ),
 
-daily_orders AS (
+-- Identical metric definitions to the base query's daily_kpis,
+-- with the primary_segment breakdown carried through.
+daily_kpis AS (
+
     SELECT
-        master_id,
-        activity_date,
-        COUNT(DISTINCT CASE WHEN OrderNumber IS NOT NULL THEN OrderNumber END) AS orders,
-        SUM(COALESCE(npb_ordered, 0))                                          AS npbe,
-        CASE WHEN COUNT(DISTINCT CASE WHEN OrderNumber IS NOT NULL THEN OrderNumber END) > 0
-             THEN 1 ELSE 0 END                                                 AS is_buyer_on_date
-    FROM dbo.fct_customer_activity_agg
-    WHERE ActiveOrderStatus = 1
-      AND activity_date IS NOT NULL
-    GROUP BY master_id, activity_date
-),
-daily_sessions AS (
-    SELECT master_id, activity_date,
-           COUNT(ga_session_id) AS total_sessions,
-           MAX(engaged_session)          AS engaged_session,
-           MAX(engagement_score_session) AS max_engagement_score,
-           MAX(intent_level_behavioral)  AS intent_level_behavioral,
-           SUM(add_to_cart)              AS add_to_cart,
-           MAX(LC_Channel)    AS LC_Channel,
-           MAX(device_type)   AS device_type,
-           MAX(Store)         AS Store,
-           MAX(business_line) AS business_line
-    FROM dbo.fct_customer_activity_agg
-    GROUP BY master_id, activity_date
-),
-daily AS (
-    SELECT
-        COALESCE(ds.master_id,     dor.master_id)     AS master_id,
-        COALESCE(ds.activity_date, dor.activity_date) AS activity_date,
-        dor.orders,
-        dor.npbe,
-        dor.is_buyer_on_date,
-        ds.total_sessions,
-        ds.engaged_session,
-        ds.max_engagement_score,
-        ds.intent_level_behavioral,
-        ds.add_to_cart,
-        ds.LC_Channel,
-        ds.device_type,
-        ds.Store,
-        ds.business_line
-    FROM      daily_sessions ds
-    FULL OUTER JOIN daily_orders dor
-        ON ds.master_id = dor.master_id
-       AND ds.activity_date = dor.activity_date
-),
-k AS (
-    SELECT
-        d.master_id,
-        d.activity_date,
-        COALESCE(r.primary_segment,   'Unclassified') AS primary_segment,
-        COALESCE(r.secondary_segment, 'Unclassified') AS secondary_segment,
-        r.lifecycle_stage,
-        r.order_substage,
-        r.session_substage,
+        f.activity_date AS [day],
+        r.primary_segment,
         r.customer_maturity,
-        COALESCE(d.orders,           0) AS orders,
-        COALESCE(d.npbe,             0) AS npbe,
-        COALESCE(d.is_buyer_on_date, 0) AS is_buyer_on_date,
-        COALESCE(d.total_sessions,   0) AS total_sessions,
-        COALESCE(d.engaged_session,  0) AS engaged_session,
-        d.business_line
-    FROM      daily d
-    LEFT JOIN segment_state_ranges r
-           ON r.master_id      = d.master_id
-          AND d.activity_date >= r.valid_from
-          AND d.activity_date <  r.valid_until
+        r.session_substage,
+        r.order_substage,
+        f.business_line,
+
+        SUM(
+            CASE
+                WHEN f.ActiveOrderStatus = 1
+                THEN COALESCE(f.npb_ordered,0)
+                ELSE 0
+            END
+        ) AS sales_npbe,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN f.OrderNumber IS NOT NULL
+                 AND f.ActiveOrderStatus = 1
+                THEN f.OrderNumber
+            END
+        ) AS orders,
+
+        COUNT(DISTINCT f.master_id) AS total_users,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN f.engaged_session = 1
+                THEN f.master_id
+            END
+        ) AS active_users,
+
+        SUM(
+            CASE
+                WHEN f.row_type IN (
+                    'ga4_session_with_order',
+                    'ga4_order_no_session_start',
+                    'ga4_session_browse_only'
+                )
+                THEN 1
+                ELSE 0
+            END
+        ) AS total_sessions,
+
+        SUM(
+            CASE
+                WHEN f.engaged_session = 1
+                THEN 1
+                ELSE 0
+            END
+        ) AS engaged_sessions
+
+    FROM fct_customer_activity_agg f
+
+    INNER JOIN segment_state_ranges r
+        ON f.master_id = r.master_id
+       AND f.activity_date >= r.valid_from
+       AND f.activity_date <  r.valid_until
+
+    WHERE f.activity_date >= '2024-04-01'
+
+    GROUP BY
+        f.activity_date,
+        f.business_line,
+        r.primary_segment,
+        r.customer_maturity,
+        r.session_substage,
+        r.order_substage
 )
 
 SELECT
-    YEAR(k.activity_date)  AS [year],
-    MONTH(k.activity_date) AS [month],
-    COUNT(DISTINCT k.master_id)                                            AS total_users,
-    COUNT(DISTINCT CASE WHEN k.engaged_session = 1 THEN k.master_id END)   AS active_users,
-    SUM(k.orders)                                                          AS order_count,
-    SUM(k.total_sessions)                                                  AS total_sessions,
-    SUM(k.npbe)                                                            AS npb_ordered,
-    k.business_line
-FROM k
-WHERE k.activity_date IS NOT NULL
+    YEAR([day])  AS [year],
+    MONTH([day]) AS [month],
+    business_line,
+    SUM(sales_npbe)       AS npb_ordered,
+    SUM(orders)           AS orders,
+    SUM(total_users)      AS total_users,      -- user-active-days (matches base rollup)
+    SUM(active_users)     AS active_users,     -- engaged user-active-days
+    SUM(total_sessions)   AS total_sessions,
+    SUM(engaged_sessions) AS engaged_sessions
+FROM daily_kpis
 GROUP BY
-    YEAR(k.activity_date),
-    MONTH(k.activity_date),
-    k.business_line
+    YEAR([day]),
+    MONTH([day]),
+    business_line
 ORDER BY
     [year],
     [month],
-    k.business_line
+    business_line
