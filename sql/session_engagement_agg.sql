@@ -56,6 +56,8 @@ base AS (
         ga_session_id,
         f.master_id,
         OrderNumber,
+        ActiveOrderStatus,   -- needed to match base: orders/revenue count only active orders
+        row_type,            -- kept so the behavioral filter can be applied/relaxed downstream
         npb_ordered,
         engaged_session,
         unique_pdp_view_count,
@@ -86,7 +88,15 @@ base AS (
         ON f.master_id      = r.master_id
        AND f.activity_date >= r.valid_from
        AND f.activity_date <  r.valid_until
-    WHERE has_behavioral_data = 1 and row_type <> 'pre_ga4_order' 
+    -- ────────────────────────────────────────────────────────────────────────
+    -- The base query applies NO behavioral filter, so leaving the filter below
+    -- ON is the single biggest reason NPBE / Orders / users come out lower than
+    -- the base: it drops every non-GA4 and pre-GA4 order row. It is commented
+    -- out here so this query counts the SAME population as the base query.
+    -- Re-enable it ONLY if you specifically want a behavioral-sessions-only cut
+    -- (in which case totals will NOT match the base query by design).
+    -- ────────────────────────────────────────────────────────────────────────
+    -- WHERE has_behavioral_data = 1 and row_type <> 'pre_ga4_order'
      -- AND activity_date >= DATEADD(YEAR, -2, CAST(GETDATE() AS DATE))
 ),
 
@@ -140,9 +150,15 @@ session_grain AS (
         MAX(most_browsed_category) AS most_browsed_category,
         MAX(most_browsed_brand)    AS most_browsed_brand,
 
-        -- orders/revenue — keep distinct-order-safe via a separate rollup
-        COUNT(DISTINCT OrderNumber)     AS session_orders,
-        SUM(COALESCE(npb_ordered, 0))  AS session_npbe   -- revisit if npb_ordered also repeats per row; if so, switch to MAX per OrderNumber first
+        -- orders/revenue — count ONLY active orders, exactly like the base query
+        --   base: COUNT(DISTINCT CASE WHEN OrderNumber IS NOT NULL
+        --                              AND ActiveOrderStatus = 1 THEN OrderNumber END)
+        --   base: SUM(CASE WHEN ActiveOrderStatus = 1 THEN COALESCE(npb_ordered,0) ELSE 0 END)
+        COUNT(DISTINCT CASE WHEN OrderNumber IS NOT NULL
+                             AND ActiveOrderStatus = 1
+                            THEN OrderNumber END)          AS session_orders,
+        SUM(CASE WHEN ActiveOrderStatus = 1
+                 THEN COALESCE(npb_ordered, 0) ELSE 0 END) AS session_npbe
 
     FROM base
     GROUP BY activity_date, activity_year, activity_month, ga_session_id, master_id
