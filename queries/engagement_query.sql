@@ -1,4 +1,29 @@
-WITH base AS (
+-- ════════════════════════════════════════════════════════════════
+-- Base query logic: build point-in-time segment validity ranges so
+-- each activity row is matched to the segment state that was valid on
+-- its activity_date (instead of fanning out across every snapshot).
+-- ════════════════════════════════════════════════════════════════
+WITH segment_state_ranges AS (
+    SELECT
+        master_id,
+        primary_segment,
+        customer_maturity,
+        session_substage,
+        order_substage,
+        snapshot_date AS valid_from,
+
+        COALESCE(
+            LEAD(snapshot_date) OVER (
+                PARTITION BY master_id
+                ORDER BY snapshot_date
+            ),
+            DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+        ) AS valid_until
+
+    FROM segment_customer_snapshot
+),
+
+base AS (
     SELECT 
         activity_date,
         YEAR(activity_date)  AS activity_year,
@@ -30,7 +55,10 @@ WITH base AS (
         most_browsed_brand,
         cart_value_atc,
         engagement_score_session,
-        s.primary_segment,
+        r.primary_segment,
+        r.customer_maturity,
+        r.session_substage,
+        r.order_substage,
 
         unique_search_count,
         add_to_cart,
@@ -42,9 +70,10 @@ WITH base AS (
         logged_in_during_session
 
     FROM [dbo].[fct_customer_activity_agg] f
-    JOIN segment_customer_snapshot s
-        ON f.master_id = s.master_id
-        --AND f.activity_date = s.snapshot_date
+    INNER JOIN segment_state_ranges r
+        ON f.master_id = r.master_id
+       AND f.activity_date >= r.valid_from
+       AND f.activity_date <  r.valid_until
     WHERE has_behavioral_data = 1 and row_type <> 'pre_ga4_order' 
      -- AND activity_date >= DATEADD(YEAR, -2, CAST(GETDATE() AS DATE))
 ),
@@ -71,6 +100,9 @@ session_grain AS (
         MAX(landing_page_type)        AS landing_page_type,
         MAX(exit_page_type)           AS exit_page_type,
         MAX(primary_segment)          AS primary_segment,
+        MAX(customer_maturity)        AS customer_maturity,
+        MAX(session_substage)         AS session_substage,
+        MAX(order_substage)           AS order_substage,
 
         MAX(engaged_session)          AS engaged_session,
         MAX(logged_in_during_session) AS logged_in_during_session,
@@ -122,6 +154,9 @@ engagement_agg AS (
         landing_page_type,
         exit_page_type,
         primary_segment,
+        customer_maturity,
+        session_substage,
+        order_substage,
         --master_id,
         --engaged_session,
         -- VOLUME
@@ -178,7 +213,8 @@ engagement_agg AS (
     GROUP by  --master_id, engaged_session,
         activity_date, activity_year, activity_month,
         intent_level_behavioral, business_line, LC_Channel, device_type,
-        Store, Operating_system, landing_page_type, exit_page_type, primary_segment
+        Store, Operating_system, landing_page_type, exit_page_type,
+        primary_segment, customer_maturity, session_substage, order_substage
 )
 
 SELECT * FROM engagement_agg;
