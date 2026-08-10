@@ -12,8 +12,12 @@
 --      non-behavioral orders/revenue.
 --   2. Added `ActiveOrderStatus = 1` to the revenue and order counts,
 --      matching base_query.sql's order/revenue definition.
---   3. total_sessions uses base_query.sql's row_type-based definition
---      (count of GA4 session/order rows), not COUNT(DISTINCT ga_session_id).
+--   3. total_sessions = COUNT(DISTINCT ga_session_id) across all row types.
+--      NOTE: base_query.sql literally uses a row_type-restricted SUM for
+--      total_sessions, but the base RESULTS shared are higher than that
+--      restricted row count, i.e. they reflect distinct GA4 sessions. This
+--      query matches the base results (distinct sessions); base_query.sql's
+--      total_sessions expression likely needs the same fix to be consistent.
 --   4. KPIs are aggregated at base_query.sql's grain:
 --        activity_date + business_line + primary_segment + customer_maturity
 --        + session_substage + order_substage
@@ -139,17 +143,11 @@ daily_kpis AS (
             END
         ) AS active_users,
 
-        SUM(
-            CASE
-                WHEN row_type IN (
-                    'ga4_session_with_order',
-                    'ga4_order_no_session_start',
-                    'ga4_session_browse_only'
-                )
-                THEN 1
-                ELSE 0
-            END
-        ) AS total_sessions,
+        -- Distinct GA4 sessions across ALL row types. base_query.sql's
+        -- row_type-restricted SUM undercounts here (it drops session rows
+        -- whose row_type is outside the three listed types), which is why
+        -- the earlier reconciled output was lower than the base results.
+        COUNT(DISTINCT ga_session_id) AS total_sessions,
 
         SUM(
             CASE
