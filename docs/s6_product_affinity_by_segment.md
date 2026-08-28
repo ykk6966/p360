@@ -5,104 +5,162 @@ DAX measures: [`dax/s6_product_affinity_by_segment.dax`](../dax/s6_product_affin
 
 ## 1. Load the data
 
-Import the SQL view's output as a table named **`Browsing Affinity`**
+Import the SQL view's output as a table named **`browsing_affinity`**
 (session-grain: `activity_date`, `Category`, `primary_segment`,
 `customer_maturity`, `New_ret`, `business_line`, `LC_Channel`,
 `device_type`, `Store`, `sessions`, `engaged_sessions`, `orders`, `NPBE`).
 
-If you already have a Date table marked as such in the model, relate
-`'Date'[Date]` (1) → `'Browsing Affinity'[activity_date]` (*). If not, use
-the `Date` calculated table at the bottom of the `.dax` file.
+Add a Date table marked as such in the model, related
+`'Date'[Date]` (1) → `'browsing_affinity'[activity_date]` (*). If you don't
+have one, use the `Date` calculated table at the bottom of the `.dax` file.
 
-## 2. Add the measures
-
-Paste every measure from `dax/s6_product_affinity_by_segment.dax` into the
-`Browsing Affinity` table. Read the comments at the top of each section —
-they explain what each measure is for before you paste it.
-
-Key idea for the **Index** tab: it's a ratio of two rates —
+## 2. Add the base measures
 
 ```
-index = (segment's orders-per-session rate for the category)
-        ÷ (everyone's orders-per-session rate for the category)
+S6 Sessions          = SUM('browsing_affinity'[sessions])
+S6 Engaged Sessions  = SUM('browsing_affinity'[engaged_sessions])
+S6 Orders            = SUM('browsing_affinity'[orders])
+S6 NPBE              = SUM('browsing_affinity'[NPBE])
 ```
 
-Both rates use *that population's sessions across every category* as the
-denominator (not just the sessions for the category in the current cell),
-so `ALL('Browsing Affinity'[Category])` / `ALL('Browsing Affinity'[primary_segment])`
-are load-bearing — don't drop them.
+## 3. Build the Browsing Affinity Index — session-based, not order-based
 
-> This table has no `master_id`, so "rate" here means *share of sessions*,
-> not *share of distinct customers*. If the business wants a strictly
-> customer-grain version of this visual later, it needs a different,
-> customer-grain source — this table can't produce it.
+Since `Category = most_browsed_category`, the index measures where a
+segment's **browsing sessions** land relative to everyone else — not a
+purchase rate:
 
-## 3. Build the tab switcher
+```
+index = (segment's share of its own sessions in this category)
+        ÷ (everyone's share of its own sessions in this category)
+```
 
-**Modeling → New parameter → Fields**, and add these five measures in this
-order:
+```dax
+S6 Segment Sessions All Categories =
+CALCULATE([S6 Sessions], REMOVEFILTERS('browsing_affinity'[Category]))
 
-1. `S6 Affinity Index`
-2. `S6 NPBE`
-3. `S6 Orders`
-4. `S6 Share of NPBE`
-5. `S6 Δ Share YoY · R7`
+S6 Segment Category Browse Rate =
+DIVIDE([S6 Sessions], [S6 Segment Sessions All Categories])
 
-This creates a small table (e.g. `S6 Metric`) with a Fields column. Rename
-the display values to match the mock's tab labels: **Index**, **NPBE**,
-**Orders**, **Share of NPBE**, **Δ Share YoY · R7**.
+S6 Overall Category Sessions =
+CALCULATE([S6 Sessions], REMOVEFILTERS('browsing_affinity'[primary_segment]))
 
-Add a slicer bound to `S6 Metric`, single-select, styled as a horizontal
-tile/pill list so it reads as tabs (`Format visual → Slicer settings →
-Style → Tile`).
+S6 Overall Sessions All Categories =
+CALCULATE(
+    [S6 Sessions],
+    REMOVEFILTERS('browsing_affinity'[Category]),
+    REMOVEFILTERS('browsing_affinity'[primary_segment])
+)
 
-## 4. Build the matrix
+S6 Overall Category Browse Rate =
+DIVIDE([S6 Overall Category Sessions], [S6 Overall Sessions All Categories])
 
-- Insert a **Matrix** visual.
-- **Rows**: `Browsing Affinity[Category]`
-- **Columns**: `Browsing Affinity[primary_segment]`
-- **Values**: the `S6 Metric` field parameter's Fields column (this is
-  what makes the matrix values change as the tab slicer changes)
-- Custom-sort `primary_segment` to a fixed order (Planner, Splurger,
-  Deadline, …) via a sort-by column if the source order isn't already
-  right, and likewise sort `Category` if you want a fixed row order rather
-  than alphabetical.
-- Number format on the Values cells: `0.0"×"`.
-- **Format visual → Row headers / Column headers → Subtotals → off.** A
-  total row/column collapses numerator and denominator to the same
-  population, so the "index" there isn't a meaningful number.
+S6 Browsing Affinity Index =
+DIVIDE([S6 Segment Category Browse Rate], [S6 Overall Category Browse Rate])
+```
 
-## 5. Conditional formatting (Index tab)
+**Debug before formatting.** Build the index matrix (Rows = `Category`,
+Columns = `primary_segment`, Values = `[S6 Browsing Affinity Index]`) with
+the measure formatted as **Decimal number, 2 decimal places** — not `x`
+yet. The matrix **Total must read 1.00**. If it doesn't, there's a
+filter-context bug in the `REMOVEFILTERS` calls above — stop and fix it
+before doing anything else with this visual.
 
-No extra DAX — use the built-in diverging color scale:
+Once the Total checks out, switch the format string to `"0.0""x"""` and
+apply conditional formatting (step 6).
+
+## 4. NPBE % of Segment Sales
+
+```dax
+S6 Segment NPBE All Categories =
+CALCULATE([S6 NPBE], REMOVEFILTERS('browsing_affinity'[Category]))
+
+S6 NPBE % of Segment Sales =
+DIVIDE([S6 NPBE], [S6 Segment NPBE All Categories])
+```
+
+Format: `0.0%`
+
+## 5. NPBE per Session
+
+No `master_id` in this table, so this is per-session, not per-customer:
+
+```dax
+S6 NPBE per Session = DIVIDE([S6 NPBE], [S6 Sessions])
+```
+
+Format: `$#,0`
+
+## 6. Δ Share YoY · R7 (NPBE and Orders)
+
+Trailing-7-day share vs. the same trailing-7-day window one year earlier,
+in **percentage points** — multiply by 100, since the page displays
+`+0.6 pp` / `-0.3 pp`, not `+0.006`.
+
+```dax
+S6 NPBE R7 =
+VAR EndDate = MAX('Date'[Date])
+RETURN CALCULATE([S6 NPBE], DATESINPERIOD('Date'[Date], EndDate, -7, DAY))
+
+S6 Segment NPBE R7 All Categories =
+CALCULATE([S6 NPBE R7], REMOVEFILTERS('browsing_affinity'[Category]))
+
+S6 NPBE Share R7 = DIVIDE([S6 NPBE R7], [S6 Segment NPBE R7 All Categories])
+
+S6 NPBE Share R7 LY =
+CALCULATE([S6 NPBE Share R7], DATEADD('Date'[Date], -1, YEAR))
+
+S6 Δ Share NPBE YoY pp =
+([S6 NPBE Share R7] - [S6 NPBE Share R7 LY]) * 100
+```
+
+Repeat the same construction on `S6 Orders` for `S6 Δ Share Orders YoY pp`
+(`S6 Orders R7`, `S6 Segment Orders R7 All Categories`, `S6 Order Share
+R7`, `S6 Order Share R7 LY`).
+
+Dynamic format for both: `"+0.0 ""pp"";-0.0 ""pp"";0.0 ""pp"""`
+
+## 7. Layout — two visuals, no tab switcher
+
+The metrics table shows all six measures at once (no field parameter, no
+tabs, no label/callout text measures):
+
+- `S6 NPBE`
+- `S6 Orders`
+- `S6 NPBE % of Segment Sales`
+- `S6 NPBE per Session`
+- `S6 Δ Share NPBE YoY pp`
+- `S6 Δ Share Orders YoY pp`
+
+The **index matrix is separate**:
+
+- Rows: `browsing_affinity[Category]`
+- Columns: `browsing_affinity[primary_segment]`
+- Values: `[S6 Browsing Affinity Index]`
+
+Verify the Total is `1.00` (Decimal number, 2 decimals) before switching
+to `0.0x` formatting and applying the diverging heatmap:
 
 **Format visual → Cell elements → Background color → Format by: Field
-value → Field: `S6 Affinity Index`** (or the field-parameter value while
-the Index tab is selected) **→ enable Diverging**:
+value → Field: `S6 Browsing Affinity Index` → enable Diverging:**
 
 | Stop | Type | Value | Color |
 |---|---|---|---|
-| Minimum | Custom value | `0.5` | pink, e.g. `#F2B8B5` |
-| Center | Number | `1` | grey/white, e.g. `#F1F1F1` |
-| Maximum | Custom value | `3` | green, e.g. `#1E7145` |
+| Minimum | Custom value | `0.5` | rust/pink |
+| Center | Number | `1` | neutral/grey |
+| Maximum | Custom value | `3` | green |
 
-Tune the min/max to the actual spread of index values once real data is
-loaded — the mock shows roughly 0.6×–3.1×, hence the 0.5/3 bounds above.
+Turn off row/column subtotals on the index matrix — a total row/column
+collapses numerator and denominator to the same population, so it isn't a
+meaningful business number (the 1.00 check above is a build-time sanity
+check, not something to ship in the visual).
 
-## 6. Explanatory text boxes
+## Not implemented (skipped per current design)
 
-The two callout boxes above the table ("Read a number like this…" and "How
-we calculate it…") are static text boxes — they document the metric, they
-don't need to react to filters. Reuse the copy from the mock as-is.
-Optional nice-to-have: swap the worked numbers in "Read a number like
-this…" for `[S6 Affinity Index Label]` / `[S6 Affinity Callout Text]`
-measures pinned to a specific example cell (e.g. via a bookmark on the
-current top cell), so the example stays truthful as data refreshes —
-skip this for v1 and keep the text static.
+- Order-based `Segment Category Rate` / `Population Category Rate` (that
+  was purchase propensity after browsing, not browsing share — dropped in
+  favor of the session-based index above).
+- Field parameter / tab switcher, `S6 Selected Metric`.
+- Affinity label / callout text measures.
 
-## 7. Legend
-
-Three static swatches + labels under the matrix: dark/light green =
-"over-indexes", grey = "~average", pink = "under-indexes" — this just
-mirrors the diverging color scale's three zones from step 5 and doesn't
-need its own measure.
+Revisit the field parameter only if the page later needs buttons/tabs to
+switch between metrics instead of showing them all at once.
